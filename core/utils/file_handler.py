@@ -10,12 +10,6 @@ os.makedirs(BASE_PROCESSED_DIR, exist_ok=True)
 
 
 def save_uploaded_file(uploaded_file) -> str:
-    """
-    Save uploaded CSV to disk as a Parquet file for fast operations.
-
-    Returns:
-        str: Path to saved Parquet file
-    """
     file_id = str(uuid.uuid4())[:8]
     file_name = f"{file_id}.parquet"
     save_path = os.path.join(BASE_UPLOAD_DIR, file_name)
@@ -26,15 +20,15 @@ def save_uploaded_file(uploaded_file) -> str:
     return save_path
 
 
-def load_parquet(path: str) -> pl.DataFrame:
+def load_parquet(path: str):
     return pl.read_parquet(path)
 
 
-def get_preview(df: pl.DataFrame, n: int = 10):
+def get_preview(df, n: int = 10):
     return df.head(n).to_pandas()
 
 
-def get_basic_info(df: pl.DataFrame) -> dict:
+def get_basic_info(df):
     return {
         "rows": df.height,
         "columns": df.width,

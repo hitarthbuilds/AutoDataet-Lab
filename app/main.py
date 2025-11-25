@@ -6,5 +6,4 @@ st.set_page_config(
 )
 
 st.title("AutoDataset Lab")
-
 st.write("Select a page from the sidebar to begin.")
