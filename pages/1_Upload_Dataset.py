@@ -1,27 +1,34 @@
 import streamlit as st
-from core.utils.file_handler import (
-    save_uploaded_file,
-    load_parquet,
-    get_preview,
-    get_basic_info
+import pandas as pd
+from core.utils.file_handler import save_uploaded_file, load_dataset
+
+st.set_page_config(
+    page_title="Upload Dataset",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 st.title("Upload Dataset")
+st.caption("Upload a CSV file up to 200MB.")
 
-if "uploaded_path" not in st.session_state:
-    st.session_state.uploaded_path = None
+uploaded_file = st.file_uploader("Browse CSV file", type=["csv"])
 
-uploaded = st.file_uploader("Upload CSV File", type=["csv"])
+if uploaded_file:
+    # save uploaded file to data/current.csv
+    saved_path = save_uploaded_file(uploaded_file)
+    
+    # store in session state
+    st.session_state["uploaded_file"] = uploaded_file
+    st.session_state["uploaded_path"] = saved_path
 
-if uploaded:
-    st.session_state.uploaded_path = save_uploaded_file(uploaded)
-    st.success("File uploaded and converted to Parquet successfully.")
+    # load dataset with safe Polars loader
+    df = load_dataset(saved_path)
 
-if st.session_state.uploaded_path:
-    df = load_parquet(st.session_state.uploaded_path)
-
+    st.success("Dataset uploaded successfully!")
+    
     st.subheader("Preview")
-    st.dataframe(get_preview(df))
+    st.dataframe(df.head(50))
 
-    st.subheader("Dataset Info")
-    st.json(get_basic_info(df))
+    st.info(
+        f"Rows: {df.shape[0]} | Columns: {df.shape[1]}"
+    )
