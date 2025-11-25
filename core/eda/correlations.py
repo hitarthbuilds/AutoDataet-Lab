@@ -1,10 +1,5 @@
-import pandas as pd
-import numpy as np
+import polars as pl
 
-def compute_correlation(pdf: pd.DataFrame):
-    numeric_df = pdf.select_dtypes(include=["float64", "int64"])
-    
-    if numeric_df.shape[1] == 0:
-        return None
-
+def correlation_matrix(df: pl.DataFrame) -> pl.DataFrame:
+    numeric_df = df.select(pl.col(pl.datatypes.NumericType))
     return numeric_df.corr()

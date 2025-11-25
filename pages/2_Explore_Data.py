@@ -1,13 +1,9 @@
 import streamlit as st
 import pandas as pd
-import polars as pl
+import matplotlib.pyplot as plt
+import numpy as np
 
 from core.utils.file_handler import load_dataset
-from core.eda.summary import dataset_overview
-from core.eda.missing_value import missing_summary, missing_heatmap
-from core.eda.correlations import compute_correlation
-from core.eda.visualisation import plot_distribution, plot_heatmap
-
 
 st.set_page_config(
     page_title="Explore Data",
@@ -17,84 +13,143 @@ st.set_page_config(
 
 st.title("Explore Data")
 
-# Check if dataset is uploaded
+# ----------------------------------
+# Load dataset from previous upload
+# ----------------------------------
 uploaded = st.session_state.get("uploaded_file", None)
 if not uploaded:
     st.warning("Please upload a dataset first from the 'Upload Dataset' page.")
     st.stop()
 
-# Load dataset (Polars)
-df = load_dataset()
+# load polars df then convert to pandas
+pl_df = load_dataset()
+df = pl_df.to_pandas()   # use pandas for all analysis
 
-# Convert to Pandas for plotting
-pdf = df.to_pandas()
+# ----------------------------------
+# Tabs
+# ----------------------------------
+tab_overview, tab_missing, tab_dist, tab_corr = st.tabs(
+    ["Overview", "Missing Values", "Distributions", "Correlations"]
+)
 
-
-# ------------------------------
-#  TABS
-# ------------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Overview",
-    "Missing Values",
-    "Distributions",
-    "Correlations"
-])
-
-
-# ------------------------------
-#  TAB 1 — OVERVIEW
-# ------------------------------
-with tab1:
+# ----------------------------------
+# OVERVIEW TAB
+# ----------------------------------
+with tab_overview:
     st.subheader("Dataset Overview")
-    overview = dataset_overview(df)
+
+    overview = {
+        "Rows": int(df.shape[0]),
+        "Columns": int(df.shape[1]),
+        "Column Names": list(df.columns),
+        "Dtypes": {col: str(dt) for col, dt in df.dtypes.items()},
+        "Numeric Columns": [
+            col for col in df.columns
+            if pd.api.types.is_numeric_dtype(df[col])
+        ],
+        "Categorical Columns": [
+            col for col in df.columns
+            if pd.api.types.is_string_dtype(df[col])
+        ],
+    }
+
     st.json(overview)
 
     st.subheader("Preview (First 100 Rows)")
-    st.dataframe(pdf.head(100), use_container_width=True)
+    st.dataframe(df.head(100), use_container_width=True)
 
 
-# ------------------------------
-#  TAB 2 — MISSING VALUES
-# ------------------------------
-with tab2:
+# ----------------------------------
+# MISSING VALUES TAB
+# ----------------------------------
+with tab_missing:
     st.subheader("Missing Value Summary")
-    summary_df = missing_summary(df)
-    st.dataframe(summary_df, use_container_width=True)
+
+    total_rows = df.shape[0]
+    missing_counts = df.isna().sum()
+    missing_percent = (missing_counts / total_rows * 100).round(2)
+
+    missing_df = pd.DataFrame({
+        "Column": df.columns,
+        "Missing": missing_counts.values,
+        "Missing %": missing_percent.values,
+        "Dtype": [str(dt) for dt in df.dtypes]
+    }).sort_values("Missing", ascending=False)
+
+    st.dataframe(missing_df, use_container_width=True)
 
     st.subheader("Missing Value Heatmap")
-    fig = missing_heatmap(pdf)
 
-    if fig:
-        st.pyplot(fig)
+    if missing_counts.sum() == 0:
+        st.success("No missing values found in this dataset.")
     else:
-        st.success("No missing values found!")
+        # show only first 1000 rows for readability
+        sample = df.head(1000)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.imshow(sample.isna(), aspect="auto", interpolation="nearest")
+        ax.set_xlabel("Columns")
+        ax.set_ylabel("Rows (first 1000)")
+        ax.set_title("Missing Value Pattern (yellow = missing)")
+        ax.set_xticks(range(len(sample.columns)))
+        ax.set_xticklabels(sample.columns, rotation=90, fontsize=8)
+        ax.set_yticks([])
+        st.pyplot(fig)
 
 
-# ------------------------------
-#  TAB 3 — DISTRIBUTIONS
-# ------------------------------
-with tab3:
+# ----------------------------------
+# DISTRIBUTIONS TAB
+# ----------------------------------
+with tab_dist:
     st.subheader("Column Distribution")
 
-    col = st.selectbox("Select a column", df.columns)
+    column = st.selectbox("Select a column", df.columns)
 
-    fig = plot_distribution(pdf, col)
-    if fig:
-        st.pyplot(fig)
-    else:
-        st.warning("This column cannot be visualized (likely non-numeric or too complex).")
+    if column:
+        series = df[column].dropna()
+
+        if series.empty:
+            st.warning("Column has only missing values.")
+        else:
+            fig, ax = plt.subplots(figsize=(8, 4))
+
+            if pd.api.types.is_numeric_dtype(series):
+                ax.hist(series, bins=40)
+                ax.set_title(f"Distribution of {column}")
+                ax.set_xlabel(column)
+                ax.set_ylabel("Frequency")
+            else:
+                # categorical / text: show top 30 categories
+                value_counts = series.value_counts().head(30)
+                ax.bar(value_counts.index.astype(str), value_counts.values)
+                ax.set_title(f"Top values in {column}")
+                ax.set_xticklabels(value_counts.index.astype(str), rotation=90, fontsize=8)
+                ax.set_ylabel("Count")
+
+            plt.tight_layout()
+            st.pyplot(fig)
 
 
-# ------------------------------
-#  TAB 4 — CORRELATIONS
-# ------------------------------
-with tab4:
+# ----------------------------------
+# CORRELATIONS TAB
+# ----------------------------------
+with tab_corr:
     st.subheader("Correlation Heatmap (Numeric Columns Only)")
 
-    corr = compute_correlation(pdf)
+    numeric_df = df.select_dtypes(include=[np.number])
 
-    if corr is None:
-        st.warning("No numeric columns available for correlation.")
+    if numeric_df.shape[1] < 2:
+        st.warning("Not enough numeric columns to compute correlations.")
     else:
-        fig = plot_heatmap(corr)
+        corr = numeric_df.corr()
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        cax = ax.imshow(corr.values, interpolation="nearest", cmap="coolwarm")
+        ax.set_xticks(range(len(corr.columns)))
+        ax.set_yticks(range(len(corr.columns)))
+        ax.set_xticklabels(corr.columns, rotation=90, fontsize=8)
+        ax.set_yticklabels(corr.columns, fontsize=8)
+        fig.colorbar(cax)
+        ax.set_title("Correlation Heatmap")
+        plt.tight_layout()
         st.pyplot(fig)
