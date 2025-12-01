@@ -1,138 +1,163 @@
+from typing import Dict, Optional, Any, NamedTuple
+import numpy as np
+
+# Support both pandas + polars seamlessly
+try:
+    import polars as pl
+except:
+    pl = None
+
 import pandas as pd
-import joblib
-from sklearn.compose import ColumnTransformer
+
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-
-from core.preprocess.clean import (
-    clean_column_names,
-    drop_duplicates,
-    drop_missing_threshold
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    StandardScaler,
+    MinMaxScaler,
+    RobustScaler
 )
+from sklearn.impute import SimpleImputer
+
+from .config import DEFAULT_CONFIG
+from .transformers import ColumnSelector
+from .rare_category import RareCategoryMerger
+from .missing_pattern import MissingIndicatorAdder
+from .leakage import detect_leakage
 
 
-# -----------------------------------------------------
-# CLEANING
-# -----------------------------------------------------
-def apply_cleaning(df: pd.DataFrame, options: dict):
-    """Apply cleaning options before ML pipeline."""
-    df = df.copy()
+# -----------------------------
+# Helpers
+# -----------------------------
 
-    if options.get("clean_columns"):
-        df = clean_column_names(df)
-
-    if options.get("drop_missing"):
-        df = drop_missing_threshold(df, 0.5)
-
-    if options.get("drop_duplicates"):
-        df = drop_duplicates(df)
-
+def ensure_pandas(df):
+    """Convert Polars → Pandas automatically."""
+    if pl is not None and isinstance(df, pl.DataFrame):
+        return df.to_pandas()
     return df
 
 
-# -----------------------------------------------------
-# IMPUTERS / ENCODERS / SCALERS
-# -----------------------------------------------------
-def get_imputer(strategy, is_numeric):
-    if is_numeric:
-        return SimpleImputer(strategy=strategy)
-    else:
-        if strategy == "constant":
-            return SimpleImputer(strategy="constant", fill_value="missing")
-        return SimpleImputer(strategy=strategy)
-
-
-def get_encoder(name):
-    name = name.lower().strip()
-
-    if name == "onehot":
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-
-    if name == "ordinal":
-        return OrdinalEncoder()
-
-    if name == "none":
-        return None
-
-    raise ValueError(f"Unknown encoder: {name}")
-
-
-def get_scaler(name):
-    name = name.lower().strip()
-
-    if name == "standard":
-        return StandardScaler()
-
+def scaler_from_name(name: str):
     if name == "minmax":
         return MinMaxScaler()
-
-    if name == "none":
-        return None
-
-    raise ValueError(f"Unknown scaler: {name}")
+    if name == "robust":
+        return RobustScaler()
+    return StandardScaler()
 
 
-# -----------------------------------------------------
-# PIPELINE BUILDER
-# -----------------------------------------------------
-def build_preprocessing_pipeline(
-    df: pd.DataFrame,
-    numeric_imputer_strategy="mean",
-    categorical_imputer_strategy="most_frequent",
-    encoder="onehot",
-    scaler="standard"
-):
-    """Build ColumnTransformer pipeline using REAL columns from df."""
+class PreprocessResult(NamedTuple):
+    pipeline: Any
+    processed_df: pd.DataFrame
+    summary: Dict
 
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    categorical_cols = df.select_dtypes(exclude=["number"]).columns.tolist()
 
-    num_imputer = get_imputer(numeric_imputer_strategy, True)
-    cat_imputer = get_imputer(categorical_imputer_strategy, False)
-    enc = get_encoder(encoder)
-    scale = get_scaler(scaler)
+# -----------------------------
+# Build Preprocessor
+# -----------------------------
 
-    # NUMERIC PIPELINE
-    num_steps = [("imputer", num_imputer)]
-    if scale is not None:
-        num_steps.append(("scaler", scale))
+def build_preprocessor(df, target_col=None, config: Optional[Dict] = None):
 
-    numeric_pipeline = Pipeline(num_steps)
+    df = ensure_pandas(df)
+    cfg = DEFAULT_CONFIG.copy()
+    if config:
+        cfg.update(config)
 
-    # CATEGORICAL PIPELINE
-    cat_steps = [("imputer", cat_imputer)]
-    if enc is not None:
-        cat_steps.append(("encoder", enc))
+    df_local = df.copy()
 
-    categorical_pipeline = Pipeline(cat_steps)
+    numerics = df_local.select_dtypes(include=["number"]).columns.tolist()
+    categoricals = df_local.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
-    transformer = ColumnTransformer(
+    # remove target column
+    if target_col in numerics:
+        numerics.remove(target_col)
+    if target_col in categoricals:
+        categoricals.remove(target_col)
+
+    # numeric
+    num_pipeline = Pipeline([
+        ("select", ColumnSelector(numerics)),
+        ("impute", SimpleImputer(strategy=cfg["imputer_numeric_strategy"])),
+        ("scale", scaler_from_name(cfg["scaler"]))
+    ])
+
+    # categorical
+    cat_pipeline = Pipeline([
+        ("select", ColumnSelector(categoricals)),
+        ("rare", RareCategoryMerger(threshold=cfg["rare_threshold"])),
+        ("impute", SimpleImputer(strategy=cfg["imputer_categorical_strategy"],
+                                 fill_value="__MISSING__")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+
+    column_tf = ColumnTransformer(
         transformers=[
-            ("num", numeric_pipeline, numeric_cols),
-            ("cat", categorical_pipeline, categorical_cols),
+            ("num", num_pipeline, numerics),
+            ("cat", cat_pipeline, categoricals),
         ],
         remainder="drop"
     )
 
-    return transformer
+    steps = []
+
+    if cfg["missing_indicator"]:
+        steps.append(("missing_ind", MissingIndicatorAdder()))
+
+    steps.append(("preproc", column_tf))
+
+    final_pipe = Pipeline(steps)
+
+    meta = {
+        "numerics": numerics,
+        "categoricals": categoricals,
+        "config": cfg
+    }
+
+    return final_pipe, meta
 
 
-# -----------------------------------------------------
-# RUNNING THE PIPELINE
-# -----------------------------------------------------
-def run_preprocessing_pipeline(df: pd.DataFrame, pipeline):
-    transformed = pipeline.fit_transform(df)
-    return pd.DataFrame(transformed)
+# -----------------------------
+# Fit + Transform
+# -----------------------------
 
+def fit_preprocessor(df, target_col=None, config=None) -> PreprocessResult:
 
-# -----------------------------------------------------
-# PIPELINE SAVE / LOAD
-# -----------------------------------------------------
-def save_pipeline(pipeline, path="pipeline.pkl"):
-    joblib.dump(pipeline, path)
+    df = ensure_pandas(df)
+    pipe, meta = build_preprocessor(df, target_col, config)
 
+    cfg = meta["config"]
 
-def load_pipeline(path="pipeline.pkl"):
-    return joblib.load(path)
+    # Leakage
+    leak_report = {}
+    if target_col and target_col in df.columns:
+        leak_report = detect_leakage(df, target_col, cfg)
+
+    # Prepare X / y
+    if target_col and target_col in df.columns:
+        X = df.drop(columns=[target_col])
+        y = df[target_col]
+    else:
+        X = df
+        y = None
+
+    pipe.fit(X, y)
+
+    X_processed = pipe.transform(X)
+
+    # numpy → pandas
+    if hasattr(X_processed, "toarray"):
+        X_processed = X_processed.toarray()
+
+    processed_df = pd.DataFrame(X_processed)
+
+    summary = {
+        "input_shape": df.shape,
+        "processed_shape": processed_df.shape,
+        "leak_report": leak_report,
+        "meta": meta
+    }
+
+    return PreprocessResult(
+        pipeline=pipe,
+        processed_df=processed_df,
+        summary=summary
+    )
